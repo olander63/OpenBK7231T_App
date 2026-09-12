@@ -26,11 +26,16 @@
 #include "drv_hlw8112.h"
 #include "drv_DCF77.h"
 
+
 void DRV_MQTTServer_Init();
 void DRV_MQTTServer_AppendInformationToHTTPIndexPage(http_request_t *request, int bPreState);
 void DRV_MQTTServer_RunEverySecond();
 void DRV_MQTTServer_RunQuickTick();
 void DRV_MQTTServer_Stop();
+// MultiButton - custom driver: 1/2/3 clicks + hold
+void MultiButton_Init();
+void MultiButton_RunQuickTick();
+void MultiButton_StopDriver();
 
 
 typedef struct driver_s {
@@ -51,6 +56,16 @@ void GirierMCU_RunEverySecond();
 
 // startDriver BL0937
 static driver_t g_drivers[] = {
+	{ "MultiButton",                         // Driver Name
+	MultiButton_Init,                        // Init
+	NULL,                                    // onEverySecond
+	NULL,                                    // appendInformationToHTTPIndexPage
+	MultiButton_RunQuickTick,                // runQuickTick
+	MultiButton_StopDriver,                  // stopFunction
+	NULL,                                    // onChannelChanged
+	NULL,                                    // onHassDiscovery
+	false,                                   // loaded
+	},
 #if ENABLE_DRIVER_TUYAMCU
 	//drvdetail:{"name":"TuyaMCU",
 	//drvdetail:"title":"TODO",
