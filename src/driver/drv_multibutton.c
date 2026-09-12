@@ -1,29 +1,42 @@
 // ============================================================================
-//  drv_multibutton.c  --  OpenBeken driver: 1 / 2 / 3 clicks + hold
-//  v2: hold toggles the relay locally, clicks 1/2/3 are fully programmable
+//  drv_multibutton.c  --  OpenBeken driver: 1 / 2 / 3 clicks + hold + status LED
+//  v3: adds a long-hold "enter config mode" trigger and owns the status LED,
+//      so the board no longer needs 5x power-cycle to re-pair, and doesn't
+//      sit lit up all the time once everything is working.
 //
 //  Written for: Tuya wall switch, board LSPS5CBA V2.0, Lightning LN882HKI
 //      button    PA4   input, internal pull-up, active LOW
 //      relay     PB5   output push-pull, active HIGH   -> OBK channel 1
 //      backlight PA3   output push-pull, active LOW    (also UART0 RX!)
-//      net LED   PA6   output push-pull, active LOW
+//      net LED   PA6   output push-pull, active LOW    -> owned by this driver,
+//                                                          leave its OBK pin role as None
 //  The driver itself is platform independent.
 //
 //  Behaviour (default):
-//      hold  (>= holdMs)  -> toggles the relay channel locally, in firmware,
-//                            so the switch keeps working with no Wi-Fi / broker
-//      1 / 2 / 3 clicks   -> MQTT event + optional local OBK command,
-//                            the relay is NOT touched, so the light never blinks
+//      hold  (>= holdMs)       -> toggles the relay channel locally, in firmware,
+//                                 so the switch keeps working with no Wi-Fi / broker
+//      hold  (>= configHoldMs) -> forces the device into config/AP mode (built-in
+//                                 'OpenAP'), so re-pairing no longer needs 5 power cycles
+//      1 / 2 / 3 clicks        -> MQTT event + optional local OBK command,
+//                                 the relay is NOT touched, so the light never blinks
 //
 //  Which event drives the relay is configurable: MB_LocalToggle <none|1|2|3|hold>
 //
+//  Status LED (optional, only if LED_Setup was called): off when WiFi+MQTT are
+//  both up ("everything is fine" state), slow blink while WiFi/MQTT are not
+//  connected, fast blink while in config/AP mode. Relay's own power-on-restore
+//  behaviour (always on / off / remember) is native OBK config, see the
+//  'Configure Startup' web page - no driver code needed for that.
+//
 //  Console commands (put them into autoexec.bat):
-//      MB_Setup   <pinIndex> [channel] [activeLow]
-//      MB_Timings <debounceMs> <gapMs> <holdMs> <holdRepeatMs>
-//      MB_Action  <1|2|3|hold> <command ...>          ("-" clears)
+//      MB_Setup      <pinIndex> [channel] [activeLow]
+//      MB_Timings    <debounceMs> <gapMs> <holdMs> <holdRepeatMs>
+//      MB_ConfigHold <ms>                              (default 10000)
+//      MB_Action     <1|2|3|hold> <command ...>        ("-" clears)
 //      MB_LocalToggle <none|1|2|3|hold>
 //      MB_Status
-//      MB_Test    <pinIndex>      // configure as input pull-up and print level
+//      MB_Test       <pinIndex>   // configure as input pull-up and print level
+//      LED_Setup     <pinIndex> [activeLow]
 //
 //  MQTT: publishes to  <clientId>/button/get  one of:
 //        single | double | triple | hold
@@ -61,6 +74,7 @@ typedef struct mbState_s {
 	int   gapMs;
 	int   holdMs;
 	int   holdRepeatMs;
+	int   configHoldMs;             // hold this long -> force config/AP mode
 	int   localEvent;               // which event toggles the relay locally
 
 	char *act[MB_MAX_CLICKS + 1];   // [0] = hold, [1..3] = click count
@@ -74,10 +88,60 @@ typedef struct mbState_s {
 	int   clicks;
 	int   holdFired;
 	int   holdRepeatTimer;
+	int   configHoldFired;
 	int   totalEvents;
 } mbState_t;
 
 static mbState_t mb;
+
+// ---------------------------------------------------------------------------
+//  Status LED - optional. Off = everything fine, blink = not fully connected.
+// ---------------------------------------------------------------------------
+typedef struct mbLed_s {
+	int pin;
+	int activeLow;
+	int lastLevel;      // physical level last written, -1 = not set yet
+	int blinkTimer;
+	int blinkOn;
+} mbLed_t;
+
+static mbLed_t led;
+
+static void MB_LedWrite(int lit) {
+	int level = led.activeLow ? !lit : lit;
+	if (level != led.lastLevel) {
+		HAL_PIN_SetOutputValue(led.pin, level);
+		led.lastLevel = level;
+	}
+}
+
+// Off when WiFi+MQTT are both up, slow blink while not connected,
+// fast blink while in config/AP mode - so the LED only draws attention
+// when there is actually something to look at.
+static void MB_LedTick(int dt) {
+	int period;
+
+	if (led.pin < 0)
+		return;
+
+	if (Main_IsOpenAccessPointMode()) {
+		period = 200;
+	} else if (!Main_HasWiFiConnected() || !MQTT_IsReady()) {
+		period = 500;
+	} else {
+		MB_LedWrite(0);
+		led.blinkTimer = 0;
+		led.blinkOn = 0;
+		return;
+	}
+
+	led.blinkTimer += dt;
+	if (led.blinkTimer >= period) {
+		led.blinkTimer = 0;
+		led.blinkOn = !led.blinkOn;
+		MB_LedWrite(led.blinkOn);
+	}
+}
 
 static const char *g_mbNames[MB_MAX_CLICKS + 1] = { "hold", "single", "double", "triple" };
 
@@ -157,9 +221,6 @@ static void MB_Fire(int idx, int isRepeat) {
 void MultiButton_RunQuickTick(void) {
 	int raw, dt;
 
-	if (!mb.inited)
-		return;
-
 #ifdef MB_FIXED_TICK_MS
 	dt = MB_FIXED_TICK_MS;
 #else
@@ -169,6 +230,11 @@ void MultiButton_RunQuickTick(void) {
 		dt = 1;
 	if (dt > 200)
 		dt = 200;                       // ignore huge stalls (OTA, scan, ...)
+
+	MB_LedTick(dt);                     // independent of button being configured
+
+	if (!mb.inited)
+		return;
 
 	raw = HAL_PIN_ReadDigitalInput(mb.pin);
 	if (mb.activeLow)
@@ -187,6 +253,7 @@ void MultiButton_RunQuickTick(void) {
 				mb.pressTimer = 0;
 				mb.holdFired = 0;
 				mb.holdRepeatTimer = 0;
+				mb.configHoldFired = 0;
 				mb.gapTimer = -1;       // freeze the click window while held
 			} else {
 				// ---- released ----
@@ -218,6 +285,15 @@ void MultiButton_RunQuickTick(void) {
 				mb.holdRepeatTimer = 0;
 				MB_Fire(MB_EV_HOLD, 1);
 			}
+		}
+		// separate, much longer threshold: force the device into config/AP
+		// mode, so re-pairing no longer needs 5 power cycles within 30s.
+		if (!mb.configHoldFired && mb.pressTimer >= mb.configHoldMs) {
+			mb.configHoldFired = 1;
+			addLogAdv(LOG_WARN, LOG_FEATURE_CMD,
+			          "MultiButton: held %ims -> forcing config/AP mode",
+			          mb.pressTimer);
+			CMD_ExecuteCommand("OpenAP", COMMAND_FLAG_SOURCE_SCRIPT);
 		}
 		return;
 	}
@@ -291,6 +367,38 @@ static commandResult_t CMD_MB_Timings(const void *context, const char *cmd,
 	return CMD_RES_OK;
 }
 
+static commandResult_t CMD_MB_ConfigHold(const void *context, const char *cmd,
+                                         const char *args, int cmdFlags) {
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 1)
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	mb.configHoldMs = Tokenizer_GetArgInteger(0);
+	if (mb.configHoldMs < mb.holdMs + 500)
+		mb.configHoldMs = mb.holdMs + 500;  // must be clearly longer than the relay-toggle hold
+	addLogAdv(LOG_INFO, LOG_FEATURE_CMD,
+	          "MultiButton: config/AP mode after %ims hold", mb.configHoldMs);
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_LED_Setup(const void *context, const char *cmd,
+                                     const char *args, int cmdFlags) {
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 1)
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	led.pin       = Tokenizer_GetArgInteger(0);
+	led.activeLow = (Tokenizer_GetArgsCount() > 1) ? Tokenizer_GetArgInteger(1) : 1;
+
+	HAL_PIN_Setup_Output(led.pin);
+	led.blinkTimer = 0;
+	led.blinkOn    = 0;
+	led.lastLevel  = led.activeLow ? 1 : 0;     // force to "off" immediately
+	HAL_PIN_SetOutputValue(led.pin, led.lastLevel);
+
+	addLogAdv(LOG_INFO, LOG_FEATURE_CMD,
+	          "MultiButton: status LED on pin %i, activeLow %i", led.pin, led.activeLow);
+	return CMD_RES_OK;
+}
+
 static commandResult_t CMD_MB_Action(const void *context, const char *cmd,
                                      const char *args, int cmdFlags) {
 	int idx;
@@ -330,9 +438,13 @@ static commandResult_t CMD_MB_Status(const void *context, const char *cmd,
 	          mb.inited ? HAL_PIN_ReadDigitalInput(mb.pin) : -1,
 	          mb.stable, mb.totalEvents);
 	addLogAdv(LOG_INFO, LOG_FEATURE_CMD,
-	          "MultiButton: debounce %i, gap %i, hold %i, holdRepeat %i, localToggle '%s'",
-	          mb.debounceMs, mb.gapMs, mb.holdMs, mb.holdRepeatMs,
+	          "MultiButton: debounce %i, gap %i, hold %i, holdRepeat %i, configHold %i, localToggle '%s'",
+	          mb.debounceMs, mb.gapMs, mb.holdMs, mb.holdRepeatMs, mb.configHoldMs,
 	          MB_EventName(mb.localEvent));
+	addLogAdv(LOG_INFO, LOG_FEATURE_CMD,
+	          "MultiButton: status LED pin %i, activeLow %i, AP mode %i, wifi %i, mqtt %i",
+	          led.pin, led.activeLow, Main_IsOpenAccessPointMode(),
+	          Main_HasWiFiConnected(), MQTT_IsReady());
 	for (i = 0; i <= MB_MAX_CLICKS; i++)
 		addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "MultiButton: [%s] cmd -> %s%s",
 		          g_mbNames[i], mb.act[i] ? mb.act[i] : "(none)",
@@ -363,15 +475,23 @@ void MultiButton_Init(void) {
 	mb.gapMs        = 400;          // clicks no longer gate the light -> can be generous
 	mb.holdMs       = 500;          // hold now switches the light, keep it snappy
 	mb.holdRepeatMs = 0;
+	mb.configHoldMs = 10000;        // hold this long -> force config/AP mode
 	mb.localEvent   = MB_EV_HOLD;   // <-- hold toggles the relay
 	mb.gapTimer     = -1;
 
+	memset(&led, 0, sizeof(led));
+	led.pin       = -1;             // status LED disabled until LED_Setup is called
+	led.activeLow = 1;
+	led.lastLevel = -1;
+
 	CMD_RegisterCommand("MB_Setup",       CMD_MB_Setup,       NULL);
 	CMD_RegisterCommand("MB_Timings",     CMD_MB_Timings,     NULL);
+	CMD_RegisterCommand("MB_ConfigHold",  CMD_MB_ConfigHold,  NULL);
 	CMD_RegisterCommand("MB_Action",      CMD_MB_Action,      NULL);
 	CMD_RegisterCommand("MB_LocalToggle", CMD_MB_LocalToggle, NULL);
 	CMD_RegisterCommand("MB_Status",      CMD_MB_Status,      NULL);
 	CMD_RegisterCommand("MB_Test",        CMD_MB_Test,        NULL);
+	CMD_RegisterCommand("LED_Setup",      CMD_LED_Setup,      NULL);
 
 	addLogAdv(LOG_INFO, LOG_FEATURE_CMD,
 	          "MultiButton driver started, call MB_Setup <pin> to bind a pin");
@@ -382,4 +502,7 @@ void MultiButton_StopDriver(void) {
 	mb.inited = 0;
 	for (i = 0; i <= MB_MAX_CLICKS; i++)
 		MB_SetAction(i, 0);
+	if (led.pin >= 0)
+		MB_LedWrite(0);
+	led.pin = -1;
 }
