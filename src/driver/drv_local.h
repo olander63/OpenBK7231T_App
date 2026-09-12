@@ -344,3 +344,7 @@ void TinyIR_NEC_RunFrame();
 void DRV_ESPHome_API_Init();
 void DRV_ESPHome_API_Deinit();
 void DRV_ESPHome_API_OnEverySecond();
+
+void MultiButton_Init(void);
+void MultiButton_RunQuickTick(void);
+void MultiButton_StopDriver(void);
