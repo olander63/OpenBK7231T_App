@@ -36,6 +36,9 @@ void DRV_MQTTServer_Stop();
 void MultiButton_Init();
 void MultiButton_RunQuickTick();
 void MultiButton_StopDriver();
+// LampIR - custom driver: NEC infrared transmitter (software 38 kHz carrier)
+void LampIR_Init();
+void LampIR_StopDriver();
 
 
 typedef struct driver_s {
@@ -62,6 +65,16 @@ static driver_t g_drivers[] = {
 	NULL,                                    // appendInformationToHTTPIndexPage
 	MultiButton_RunQuickTick,                // runQuickTick
 	MultiButton_StopDriver,                  // stopFunction
+	NULL,                                    // onChannelChanged
+	NULL,                                    // onHassDiscovery
+	false,                                   // loaded
+	},
+	{ "LampIR",                              // Driver Name
+	LampIR_Init,                             // Init
+	NULL,                                    // onEverySecond
+	NULL,                                    // appendInformationToHTTPIndexPage
+	NULL,                                    // runQuickTick
+	LampIR_StopDriver,                       // stopFunction
 	NULL,                                    // onChannelChanged
 	NULL,                                    // onHassDiscovery
 	false,                                   // loaded

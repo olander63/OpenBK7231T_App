@@ -348,3 +348,5 @@ void DRV_ESPHome_API_OnEverySecond();
 void MultiButton_Init(void);
 void MultiButton_RunQuickTick(void);
 void MultiButton_StopDriver(void);
+void LampIR_Init(void);
+void LampIR_StopDriver(void);

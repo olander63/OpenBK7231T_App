@@ -108,6 +108,7 @@ set(OBKM_SRC
 	${OBK_SRCS}driver/drv_mqttServerBerry.c
 	${OBK_SRCS}driver/drv_multiPinI2CScanner.c
 	${OBK_SRCS}driver/drv_multibutton.c
+	${OBK_SRCS}driver/drv_lampir.c
 	${OBK_SRCS}driver/drv_ntp.c
 	${OBK_SRCS}driver/drv_deviceclock.c
 	${OBK_SRCS}driver/drv_ds3231.c
