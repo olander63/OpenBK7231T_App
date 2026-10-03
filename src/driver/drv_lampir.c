@@ -11,6 +11,8 @@
 //  Console:
 //      LampIR_Setup <pin>
 //      LampIR_Send  <addrHex> <cmdHex> [repeats]      e.g.  LampIR_Send 80 1D
+//      LampIR_Raw   <us> <us> ...                     replay a recorded frame: mark, space,
+//                                                     mark ... (signs ignored), <= 160 values
 //      LampIR_Carrier <ms>      steady 38 kHz burst (10..5000 ms): a multimeter on the
 //                               pin reads ~half of 3.3 V, the LED glows steadily on a camera
 //      LampIR_Status
@@ -161,6 +163,32 @@ static commandResult_t CMD_LampIR_Send(const void *context, const char *cmd,
 	return CMD_RES_OK;
 }
 
+static commandResult_t CMD_LampIR_Raw(const void *context, const char *cmd,
+                                      const char *args, int cmdFlags) {
+	const char *p = args;
+	char *e;
+
+	if (lir_start() != CMD_RES_OK)
+		return CMD_RES_ERROR;
+
+	lir_count = 0;
+	while (*p) {
+		long v = strtol(p, &e, 10);
+		if (e == p) {
+			p++;
+			continue;
+		}
+		lir_add((uint32_t)(v < 0 ? -v : v));
+		p = e;
+	}
+	if (lir_count < 2)
+		return CMD_RES_BAD_ARGUMENT;
+	lir_go();
+
+	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: raw frame, %i entries", lir_count);
+	return CMD_RES_OK;
+}
+
 static commandResult_t CMD_LampIR_Carrier(const void *context, const char *cmd,
                                           const char *args, int cmdFlags) {
 	int ms;
@@ -202,6 +230,7 @@ void LampIR_Init(void) {
 
 	CMD_RegisterCommand("LampIR_Setup", CMD_LampIR_Setup, NULL);
 	CMD_RegisterCommand("LampIR_Send",  CMD_LampIR_Send,  NULL);
+	CMD_RegisterCommand("LampIR_Raw",   CMD_LampIR_Raw,   NULL);
 	CMD_RegisterCommand("LampIR_Carrier", CMD_LampIR_Carrier, NULL);
 	CMD_RegisterCommand("LampIR_Status", CMD_LampIR_Status, NULL);
 
