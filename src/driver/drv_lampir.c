@@ -16,8 +16,11 @@
 //      LampIR_Raw   <us> <us> ...                     replay a recorded frame: mark, space,
 //                                                     mark ... (signs ignored), <= 160 values;
 //                                                     the web console cuts commands at ~127 chars
-//      LampIR_Carrier <ms>      steady 38 kHz burst (10..5000 ms): a multimeter on the
-//                               pin reads ~half of 3.3 V, the LED glows steadily on a camera
+//      LampIR_Carrier <ms> [dc] steady 38 kHz burst (10..5000 ms): a multimeter on the
+//                               pin reads ~half of 3.3 V, the LED glows steadily on a camera.
+//                               With a 2nd argument the pin is held HIGH instead (up to 30 s):
+//                               LED test without the carrier, measure the output stage
+//                               (pin / collector / voltage across the LED resistor)
 //      LampIR_Status
 //
 //  'repeats' = NEC repeat frames after the first one (what a remote sends while
@@ -49,6 +52,7 @@ static uint32_t lir_ticks[LIR_MAX_ENTRIES];
 static int      lir_count;
 static volatile int      lir_idx;
 static volatile int      lir_level;
+static volatile int      lir_dc;       // marks held high instead of 38 kHz (LED test)
 static volatile int      lir_busy;
 static volatile uint32_t lir_left;
 static volatile uint32_t lir_isr;      // ISR calls, for LampIR_Status
@@ -105,7 +109,7 @@ static void lir_tick(void *arg) {
 		lir_busy = 0;
 		return;
 	}
-	lir_level = (lir_idx & 1) ? 0 : !lir_level;     // mark: carrier, space: low
+	lir_level = (lir_idx & 1) ? 0 : (lir_dc || !lir_level);     // mark: carrier (or high), space: low
 	HAL_PIN_SetOutputValue(lir_pin, lir_level);
 	if (--lir_left == 0 && ++lir_idx < lir_count)
 		lir_left = lir_ticks[lir_idx];
@@ -170,6 +174,7 @@ static commandResult_t lir_start(void) {
 		addLogAdv(LOG_WARN, LOG_FEATURE_CMD, "LampIR: busy, command dropped");
 		return CMD_RES_ERROR;
 	}
+	lir_dc = 0;
 	return CMD_RES_OK;
 }
 
@@ -296,16 +301,18 @@ static commandResult_t CMD_LampIR_Carrier(const void *context, const char *cmd,
 	if (lir_start() != CMD_RES_OK)
 		return CMD_RES_ERROR;
 
+	lir_dc = Tokenizer_GetArgsCount() > 1;
 	ms = Tokenizer_GetArgInteger(0);
 	if (ms < 10)
 		ms = 10;
-	if (ms > 5000)
-		ms = 5000;
+	if (ms > (lir_dc ? 30000 : 5000))
+		ms = lir_dc ? 30000 : 5000;
 	lir_count = 0;
 	lir_add((uint32_t)ms * 1000);
 	lir_go();
 
-	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: carrier for %i ms", ms);
+	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: %s for %i ms (a 38 kHz carrier = %i ISR/s)",
+	          lir_dc ? "pin HIGH" : "carrier", ms, 1000000 / LIR_TICK_US);
 	return CMD_RES_OK;
 }
 
@@ -334,6 +341,17 @@ void LampIR_Init(void) {
 
 	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR driver started, HW timer %i, tick %.1f us",
 	          (int)lir_timer, real);
+}
+
+// Real timer rate: a full second of carrier must log ~76923 ISR/s, otherwise the
+// carrier is not 38 kHz whatever the pin average says.
+void LampIR_OnEverySecond(void) {
+	static uint32_t prev;
+	uint32_t n = lir_isr;
+
+	if (n != prev)
+		addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: %u ISR in the last second", (unsigned)(n - prev));
+	prev = n;
 }
 
 void LampIR_StopDriver(void) {

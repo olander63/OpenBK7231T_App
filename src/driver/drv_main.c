@@ -39,6 +39,7 @@ void MultiButton_StopDriver();
 // LampIR - custom driver: NEC infrared transmitter (software 38 kHz carrier)
 void LampIR_Init();
 void LampIR_StopDriver();
+void LampIR_OnEverySecond();
 
 
 typedef struct driver_s {
@@ -71,7 +72,7 @@ static driver_t g_drivers[] = {
 	},
 	{ "LampIR",                              // Driver Name
 	LampIR_Init,                             // Init
-	NULL,                                    // onEverySecond
+	LampIR_OnEverySecond,                    // onEverySecond
 	NULL,                                    // appendInformationToHTTPIndexPage
 	NULL,                                    // runQuickTick
 	LampIR_StopDriver,                       // stopFunction
