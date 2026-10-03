@@ -263,6 +263,7 @@ void HAL_PIN_PWM_Start(int index, int freq)
 	if(pin->pwm_cha >= 0)
 	{
 		pwm_init(freq, pin->pwm_cha, pin->base, pin->pin);
+		pwm_start(pin->pwm_cha);
 		return;
 	}
 	uint8_t freecha;
