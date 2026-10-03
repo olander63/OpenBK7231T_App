@@ -11,6 +11,9 @@
 //  Console:
 //      LampIR_Setup <pin>
 //      LampIR_Send  <addrHex> <cmdHex> [repeats]      e.g.  LampIR_Send 80 1D
+//      LampIR_Carrier <ms>      steady 38 kHz burst (10..5000 ms): a multimeter on the
+//                               pin reads ~half of 3.3 V, the LED glows steadily on a camera
+//      LampIR_Status
 //
 //  'repeats' = NEC repeat frames after the first one (what a remote sends while
 //  its key is held, used for brightness / speed steps), max 20.
@@ -43,6 +46,7 @@ static volatile int      lir_idx;
 static volatile int      lir_level;
 static volatile int      lir_busy;
 static volatile uint32_t lir_left;
+static volatile uint32_t lir_isr;      // ISR calls, for LampIR_Status
 
 static void lir_add(uint32_t us) {
 	if (lir_count >= LIR_MAX_ENTRIES)
@@ -83,6 +87,7 @@ static void lir_build(int addr, int cmd, int repeats) {
 
 // Timer ISR: no logging, no allocation in here.
 static void lir_tick(void *arg) {
+	lir_isr++;
 	if (lir_idx >= lir_count) {
 		HAL_PIN_SetOutputValue(lir_pin, 0);
 		HAL_HWTimerStop(lir_timer);
@@ -93,6 +98,26 @@ static void lir_tick(void *arg) {
 	HAL_PIN_SetOutputValue(lir_pin, lir_level);
 	if (--lir_left == 0 && ++lir_idx < lir_count)
 		lir_left = lir_ticks[lir_idx];
+}
+
+static commandResult_t lir_start(void) {
+	if (lir_pin < 0 || lir_timer < 0) {
+		addLogAdv(LOG_ERROR, LOG_FEATURE_CMD, "LampIR: call LampIR_Setup <pin> first");
+		return CMD_RES_ERROR;
+	}
+	if (lir_busy) {
+		addLogAdv(LOG_WARN, LOG_FEATURE_CMD, "LampIR: busy, command dropped");
+		return CMD_RES_ERROR;
+	}
+	return CMD_RES_OK;
+}
+
+static void lir_go(void) {
+	lir_idx = 0;
+	lir_left = lir_ticks[0];
+	lir_level = 0;
+	lir_busy = 1;
+	HAL_HWTimerStart(lir_timer);
 }
 
 static commandResult_t CMD_LampIR_Setup(const void *context, const char *cmd,
@@ -116,14 +141,8 @@ static commandResult_t CMD_LampIR_Send(const void *context, const char *cmd,
 	Tokenizer_TokenizeString(args, 0);
 	if (Tokenizer_GetArgsCount() < 2)
 		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
-	if (lir_pin < 0 || lir_timer < 0) {
-		addLogAdv(LOG_ERROR, LOG_FEATURE_CMD, "LampIR: call LampIR_Setup <pin> first");
+	if (lir_start() != CMD_RES_OK)
 		return CMD_RES_ERROR;
-	}
-	if (lir_busy) {
-		addLogAdv(LOG_WARN, LOG_FEATURE_CMD, "LampIR: busy, command dropped");
-		return CMD_RES_ERROR;
-	}
 
 	addr = strtol(Tokenizer_GetArg(0), 0, 16);
 	code = strtol(Tokenizer_GetArg(1), 0, 16);
@@ -135,14 +154,41 @@ static commandResult_t CMD_LampIR_Send(const void *context, const char *cmd,
 		repeats = LIR_MAX_REPEATS;
 
 	lir_build(addr, code, repeats);
-	lir_idx = 0;
-	lir_left = lir_ticks[0];
-	lir_level = 0;
-	lir_busy = 1;
-	HAL_HWTimerStart(lir_timer);
+	lir_go();
 
 	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: NEC addr 0x%X cmd 0x%X repeats %i",
 	          addr & 0xFF, code & 0xFF, repeats);
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_LampIR_Carrier(const void *context, const char *cmd,
+                                          const char *args, int cmdFlags) {
+	int ms;
+
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 1)
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	if (lir_start() != CMD_RES_OK)
+		return CMD_RES_ERROR;
+
+	ms = Tokenizer_GetArgInteger(0);
+	if (ms < 10)
+		ms = 10;
+	if (ms > 5000)
+		ms = 5000;
+	lir_count = 0;
+	lir_add((uint32_t)ms * 1000);
+	lir_go();
+
+	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: carrier for %i ms", ms);
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_LampIR_Status(const void *context, const char *cmd,
+                                         const char *args, int cmdFlags) {
+	addLogAdv(LOG_INFO, LOG_FEATURE_CMD,
+	          "LampIR: pin %i, timer %i, busy %i, entry %i/%i, ISR calls %u",
+	          lir_pin, (int)lir_timer, (int)lir_busy, (int)lir_idx, lir_count, (unsigned)lir_isr);
 	return CMD_RES_OK;
 }
 
@@ -156,6 +202,8 @@ void LampIR_Init(void) {
 
 	CMD_RegisterCommand("LampIR_Setup", CMD_LampIR_Setup, NULL);
 	CMD_RegisterCommand("LampIR_Send",  CMD_LampIR_Send,  NULL);
+	CMD_RegisterCommand("LampIR_Carrier", CMD_LampIR_Carrier, NULL);
+	CMD_RegisterCommand("LampIR_Status", CMD_LampIR_Status, NULL);
 
 	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR driver started, HW timer %i, tick %.1f us",
 	          (int)lir_timer, real);
