@@ -371,7 +371,7 @@ static OBK_Publish_Result lamp_publish_one(int bit) {
 		lamp_device(dev, sizeof(dev), "fan", "Вентилятор");
 		snprintf(topic, sizeof(topic), "homeassistant/fan/%s_ir_fan/config", dn);
 		snprintf(pub_buf, sizeof(pub_buf),
-		         "{\"name\":null,\"uniq_id\":\"%s_ir_fan\",\"~\":\"%s\",\"icon\":\"mdi:ceiling-fan\","
+		         "{\"name\":null,\"uniq_id\":\"%s_ir_fan\",\"~\":\"%s\","
 		         "\"cmd_t\":\"cmnd/%s/Lamp_Fan\",\"stat_t\":\"~/lamp_fan/get\",\"avty_t\":\"~/connected\","
 		         "\"percentage_command_topic\":\"cmnd/%s/Lamp_Speed\",\"percentage_state_topic\":\"~/lamp_speed/get\","
 		         "\"speed_range_min\":1,\"speed_range_max\":%i,\"dev\":%s}",
