@@ -1,48 +1,76 @@
 // ============================================================================
-//  drv_lampir.c  --  OpenBeken driver: NEC infrared transmitter
+//  drv_lampir.c  --  OpenBeken driver: IR remote of the ceiling lamp + fan,
+//                    and a model of the lamp's state
 //
 //  The 38 kHz carrier is made in software: a HW timer ticks every 13 us and the
-//  ISR toggles a plain GPIO while an NEC "mark" is on. (OBK's hardware PWM path
+//  ISR toggles a plain GPIO while an IR "mark" is on. (OBK's hardware PWM path
 //  puts nothing on the pin on this LN882H board, plain GPIO output works.)
+//  The lamp's own remote frames (NEC, addr 0x80) are replayed from recordings.
 //
-//  Hardware: GPIO -> 1k -> NPN base, LED + resistor from 3V3 to the collector,
+//  Hardware: GPIO -> 1k -> NPN base, IR LED + resistor from 3V3 to the collector,
 //  so pin HIGH = LED on. Leave the pin's OBK role as None.
 //
-//  Console:
-//      LampIR_Setup <pin>
-//      LampIR_Send  <addrHex> <cmdHex> [repeats]      e.g.  LampIR_Send 80 1D
-//      LampIR_Code  <on|off|bright_up|bright_down|warm|cold|fan|fan_up|fan_down> [repeats]
-//                                                     replay a frame recorded from the lamp's remote
-//      LampIR_Raw   <us> <us> ...                     replay a recorded frame: mark, space,
-//                                                     mark ... (signs ignored), <= 160 values;
-//                                                     the web console cuts commands at ~127 chars
-//      LampIR_Carrier <ms> [dc] steady 38 kHz burst (10..5000 ms): a multimeter on the
-//                               pin reads ~half of 3.3 V, the LED glows steadily on a camera.
-//                               With a 2nd argument the pin is held HIGH instead (up to 30 s):
-//                               LED test without the carrier, measure the output stage
-//                               (pin / collector / voltage across the LED resistor)
+//  The lamp (what the physical remote and the relay do to it):
+//    - mains relay (OBK channel 1) off  -> light and fan are off
+//    - mains relay back on              -> the light comes on by itself, the fan stays off
+//    - light: discrete on / off codes, 10 brightness steps, 10 colour steps
+//    - fan: ONE toggle code, 6 speed steps; both light and fan remember their settings
+//  IR is one way, so light/fan/brightness/colour/speed are ASSUMED states:
+//  every step is a separate remote press. Values that may be wrong are fixed by
+//  Lamp_Set (tell the model) or Lamp_Sync (drive the lamp to its stops).
+//
+//  Console (also usable from MQTT:  cmnd/<clientId>/<command>  payload = argument):
+//      LampIR_Setup <pin>             IR LED pin
+//      Lamp_Light <on|off|toggle>
+//      Lamp_Brightness <1..10>        turns the light on if needed
+//      Lamp_Temp <1..10>              1 = 2700K warm ... 10 = 6500K cold
+//      Lamp_Fan <on|off|toggle>
+//      Lamp_Speed <1..6>              turns the fan on if needed
+//      Lamp_Click <1|2|3>             what a wall-switch click does (MultiButton calls it)
+//      Lamp_Hold                      relay off, light + fan off
+//      Lamp_Set <light|fan|bright|temp|speed> <value>   fix the model, sends nothing
+//      Lamp_Sync                      drive brightness, colour, speed to their lowest stop
+//      Lamp_Tune <gapMs> [repeats] [bootMs]   time between remote presses, NEC repeat
+//                                     frames per press, wait after the lamp gets power
+//      Lamp_Status
+//      LampIR_Code <name> [repeats]   send one recorded remote button (see lir_codes)
+//      LampIR_Carrier <ms> [dc]       38 kHz burst / pin held HIGH, for checking the LED
 //      LampIR_Status
 //
-//  'repeats' = NEC repeat frames after the first one (what a remote sends while
-//  its key is held, used for brightness / speed steps), max 20.
+//  State is published retained to <clientId>/lamp/get as JSON
+//  {"light":1,"bright":5,"temp":3,"fan":0,"speed":2} (0 = unknown).
 //
-//  ponytail: one send at a time, a new LampIR_Send while busy is rejected.
-//            Add a queue when commands from HA start to collide.
+//  ponytail: no IR receiver, so a press on the real remote is invisible; tell the
+//            model with Lamp_Set or Lamp_Sync. Add a receiver pin to track it.
 //  ponytail: 13 us tick -> 38.46 kHz (+1.2 %). Change LIR_TICK_US if a receiver
 //            turns out to be picky.
 // ============================================================================
 
 #include "../new_common.h"
+#include "../new_pins.h"
 #include "../logging/logging.h"
 #include "../cmnds/cmd_public.h"
 #include "../hal/hal_pins.h"
 #include "../hal/hal_hwtimer.h"
+#include "../hal/hal_flashVars.h"
+#include "../mqtt/new_mqtt.h"
 #include "drv_local.h"
+
+extern int g_deltaTimeMS;              // ms elapsed since previous quick tick
 
 #define LIR_TICK_US      13         // half a carrier period
 #define LIR_FRAME_US     108000     // NEC repeat period, start of frame to start of frame
 #define LIR_MAX_REPEATS  20
 #define LIR_MAX_ENTRIES  160        // 67 for a frame + 4 per repeat
+
+#define LAMP_RELAY_CH    1
+#define LAMP_STEPS       10         // brightness and colour positions
+#define LAMP_SPEEDS      6          // fan speed positions
+#define LAMP_OVERSHOOT   2          // extra presses at a stop, heals a drifted model
+#define LAMP_QUEUE       128
+#define LAMP_FV_BRIGHT   5          // flash-var slots (0..11): kept across reboots
+#define LAMP_FV_TEMP     6
+#define LAMP_FV_SPEED    7
 
 static int8_t lir_timer = -1;
 static int    lir_pin = -1;
@@ -77,27 +105,6 @@ static void lir_repeats(uint32_t t, int repeats) {
 		lir_add(560);
 		t = 9000 + 2250 + 560;
 	}
-}
-
-// NEC: 9 ms + 4.5 ms header, 32 bits LSB first (addr, ~addr, cmd, ~cmd),
-// bit = 560 us mark + 560 (0) / 1690 (1) us space, 560 us stop mark.
-static void lir_build(int addr, int cmd, int repeats) {
-	uint32_t d = (addr & 0xFF) | ((~addr & 0xFF) << 8) |
-	             ((cmd & 0xFF) << 16) | ((uint32_t)(~cmd & 0xFF) << 24);
-	uint32_t t = 9000 + 4500 + 560;
-	int i;
-
-	lir_count = 0;
-	lir_add(9000);
-	lir_add(4500);
-	for (i = 0; i < 32; i++) {
-		uint32_t sp = ((d >> i) & 1) ? 1690 : 560;
-		lir_add(560);
-		lir_add(sp);
-		t += 560 + sp;
-	}
-	lir_add(560);
-	lir_repeats(t, repeats);
 }
 
 // Timer ISR: no logging, no allocation in here.
@@ -165,6 +172,9 @@ static const struct { const char *name; const uint16_t *d; } lir_codes[] = {
 	{ "warm", lir_code_warm },
 };
 
+// order of lir_codes[]
+enum { C_BRIGHT_DOWN, C_BRIGHT_UP, C_FAN, C_FAN_DOWN, C_FAN_UP, C_OFF, C_ON, C_COLD, C_WARM, C_COUNT };
+
 static commandResult_t lir_start(void) {
 	if (lir_pin < 0 || lir_timer < 0) {
 		addLogAdv(LOG_ERROR, LOG_FEATURE_CMD, "LampIR: call LampIR_Setup <pin> first");
@@ -186,6 +196,334 @@ static void lir_go(void) {
 	HAL_HWTimerStart(lir_timer);
 }
 
+static void lir_send(int code, int repeats) {
+	int k;
+	uint32_t t = 0;
+
+	lir_count = 0;
+	for (k = 0; k < 67; k++) {
+		lir_add(lir_codes[code].d[k]);
+		t += lir_codes[code].d[k];
+	}
+	lir_repeats(t, repeats);
+	lir_go();
+}
+
+// ---------------------------------------------------------------------------
+//  Lamp model
+// ---------------------------------------------------------------------------
+static struct {
+	int light, fan;                     // assumed on / off
+	int bright, temp, speed;            // 1..max, 0 = unknown
+	int dirty;                          // needs publishing
+} L;
+
+static struct { uint8_t c[LAMP_QUEUE]; int h, n; } lq;      // remote presses to send
+static int lir_wait;                    // ms until the next press may start
+static int lir_gap = 250;               // ms between presses (start to start)
+static int lir_press_repeats;           // NEC repeat frames after each press
+static int lir_boot = 2000;             // ms the lamp needs after it gets power
+static int lamp_saved[3];               // flash copies of bright / temp / speed
+
+static int relay(void) {
+	return CHANNEL_Get(LAMP_RELAY_CH) > 0;
+}
+
+static void q_add(int code) {
+	if (lir_pin < 0)
+		return;
+	if (lq.n >= LAMP_QUEUE) {
+		addLogAdv(LOG_WARN, LOG_FEATURE_CMD, "Lamp: IR queue full, press dropped");
+		return;
+	}
+	lq.c[(lq.h + lq.n++) % LAMP_QUEUE] = (uint8_t)code;
+}
+
+static void light_set(int on) {
+	q_add(on ? C_ON : C_OFF);
+	L.light = on;
+	L.dirty = 1;
+}
+
+// Relay on powers the lamp: it lights up by itself, the fan stays off.
+// Called from the OBK channel callback, so HA / web / button / script all end up here.
+void LampIR_OnChannelChanged(int ch, int val) {
+	if (ch != LAMP_RELAY_CH)
+		return;
+	if (val) {
+		L.light = 1;
+		L.fan = 0;
+		if (lir_wait < lir_boot)
+			lir_wait = lir_boot;
+	} else {
+		L.light = L.fan = 0;
+		lq.n = 0;                       // the lamp has no power, drop pending presses
+	}
+	L.dirty = 1;
+}
+
+// true if the lamp had no power (it then lights up by itself)
+static int lamp_power(void) {
+	if (relay())
+		return 0;
+	CHANNEL_Set(LAMP_RELAY_CH, 1, 0);
+	return 1;
+}
+
+static void lamp_light_on(void) {
+	if (!lamp_power() && !L.light)
+		light_set(1);
+}
+
+// Move a stepped value to target with remote presses. Unknown (0): hit the
+// lower stop first. A stop gets extra presses so a drifted model heals itself.
+static void step_to(int *cur, int target, int max, int up, int down) {
+	int n;
+
+	if (*cur == 0) {
+		for (n = 0; n < max; n++)
+			q_add(down);
+		*cur = 1;
+	}
+	for (n = *cur; n < target; n++)
+		q_add(up);
+	for (n = *cur; n > target; n--)
+		q_add(down);
+	if (target == max || target == 1)
+		for (n = 0; n < LAMP_OVERSHOOT; n++)
+			q_add(target == max ? up : down);
+	*cur = target;
+	L.dirty = 1;
+}
+
+static void lamp_fan(int on) {
+	if (on == L.fan)
+		return;
+	if (on && lamp_power())
+		light_set(0);                   // the lamp lit up by itself, a fan request keeps the light off
+	q_add(C_FAN);
+	L.fan = on;
+	if (on && !L.speed)
+		step_to(&L.speed, 1, LAMP_SPEEDS, C_FAN_UP, C_FAN_DOWN);
+	L.dirty = 1;
+}
+
+static void lamp_save(void) {
+	int v[3] = { L.bright, L.temp, L.speed };
+	static const int slot[3] = { LAMP_FV_BRIGHT, LAMP_FV_TEMP, LAMP_FV_SPEED };
+	int i;
+
+	for (i = 0; i < 3; i++)
+		if (lamp_saved[i] != v[i]) {
+			lamp_saved[i] = v[i];
+			HAL_FlashVars_SaveChannel(slot[i], v[i]);
+		}
+}
+
+static void lamp_publish(void) {
+	char s[80];
+
+	snprintf(s, sizeof(s), "{\"light\":%i,\"bright\":%i,\"temp\":%i,\"fan\":%i,\"speed\":%i}",
+	         L.light, L.bright, L.temp, L.fan, L.speed);
+	if (MQTT_PublishMain_StringString("lamp", s, OBK_PUBLISH_FLAG_RETAIN) == OBK_PUBLISH_OK)
+		L.dirty = 0;
+}
+
+// Called from the OBK main loop: paces the remote presses and publishes the state.
+void LampIR_RunQuickTick(void) {
+	static int wasReady;
+	int dt = g_deltaTimeMS, ready;
+
+	if (dt <= 0)
+		dt = 1;
+	if (dt > 200)
+		dt = 200;                       // ignore huge stalls (OTA, scan, ...)
+	if (lir_wait > 0)
+		lir_wait -= dt;
+
+	if (lq.n && lir_wait <= 0 && !lir_busy && lir_pin >= 0 && lir_timer >= 0) {
+		lir_send(lq.c[lq.h], lir_press_repeats);
+		lq.h = (lq.h + 1) % LAMP_QUEUE;
+		lq.n--;
+		lir_wait = lir_gap;
+	} else if (!lq.n && !lir_busy) {
+		lamp_save();                    // one flash write after a burst of presses
+	}
+
+	ready = MQTT_IsReady();
+	if (ready && !wasReady)
+		L.dirty = 1;
+	wasReady = ready;
+	if (L.dirty && ready)
+		lamp_publish();
+}
+
+// on / off / toggle -> 1 / 0, anything else -> -1
+static int onoff_arg(const char *args, int cur) {
+	const char *a;
+
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 1)
+		return -1;
+	a = Tokenizer_GetArg(0);
+	if (!strcmp(a, "toggle"))
+		return !cur;
+	if (!strcmp(a, "on") || !strcmp(a, "1"))
+		return 1;
+	if (!strcmp(a, "off") || !strcmp(a, "0"))
+		return 0;
+	return -1;
+}
+
+static commandResult_t CMD_Lamp_Light(const void *context, const char *cmd,
+                                      const char *args, int cmdFlags) {
+	int on = onoff_arg(args, L.light);
+
+	if (on < 0)
+		return CMD_RES_BAD_ARGUMENT;
+	if (on)
+		lamp_light_on();
+	else if (relay())
+		light_set(0);
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_Lamp_Fan(const void *context, const char *cmd,
+                                    const char *args, int cmdFlags) {
+	int on = onoff_arg(args, L.fan);
+
+	if (on < 0)
+		return CMD_RES_BAD_ARGUMENT;
+	lamp_fan(on);
+	return CMD_RES_OK;
+}
+
+// shared by Lamp_Brightness / Lamp_Temp / Lamp_Speed
+static commandResult_t lamp_value(const char *args, int *cur, int max, int up, int down, int fan) {
+	int v;
+
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 1)
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	v = Tokenizer_GetArgInteger(0);
+	if (v < 1 || v > max)
+		return CMD_RES_BAD_ARGUMENT;
+	if (fan)
+		lamp_fan(1);
+	else
+		lamp_light_on();
+	step_to(cur, v, max, up, down);
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_Lamp_Brightness(const void *context, const char *cmd,
+                                           const char *args, int cmdFlags) {
+	return lamp_value(args, &L.bright, LAMP_STEPS, C_BRIGHT_UP, C_BRIGHT_DOWN, 0);
+}
+
+static commandResult_t CMD_Lamp_Temp(const void *context, const char *cmd,
+                                     const char *args, int cmdFlags) {
+	return lamp_value(args, &L.temp, LAMP_STEPS, C_COLD, C_WARM, 0);
+}
+
+static commandResult_t CMD_Lamp_Speed(const void *context, const char *cmd,
+                                      const char *args, int cmdFlags) {
+	return lamp_value(args, &L.speed, LAMP_SPEEDS, C_FAN_UP, C_FAN_DOWN, 1);
+}
+
+// Wall switch: 1 click = relay on / light toggle, 2 clicks = relay on (light stays off) / fan toggle.
+static commandResult_t CMD_Lamp_Click(const void *context, const char *cmd,
+                                      const char *args, int cmdFlags) {
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 1)
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	switch (Tokenizer_GetArgInteger(0)) {
+	case 1:
+		if (!lamp_power())
+			light_set(!L.light);
+		break;
+	case 2:
+		lamp_fan(!L.fan);
+		break;
+	}
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_Lamp_Hold(const void *context, const char *cmd,
+                                     const char *args, int cmdFlags) {
+	if (relay())
+		CHANNEL_Set(LAMP_RELAY_CH, 0, 0);
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_Lamp_Set(const void *context, const char *cmd,
+                                    const char *args, int cmdFlags) {
+	const char *n;
+	int v;
+
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 2)
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	n = Tokenizer_GetArg(0);
+	v = Tokenizer_GetArgInteger(1);
+	if (!strcmp(n, "light"))
+		L.light = v > 0;
+	else if (!strcmp(n, "fan"))
+		L.fan = v > 0;
+	else if (!strcmp(n, "bright") && v >= 0 && v <= LAMP_STEPS)
+		L.bright = v;
+	else if (!strcmp(n, "temp") && v >= 0 && v <= LAMP_STEPS)
+		L.temp = v;
+	else if (!strcmp(n, "speed") && v >= 0 && v <= LAMP_SPEEDS)
+		L.speed = v;
+	else
+		return CMD_RES_BAD_ARGUMENT;
+	L.dirty = 1;
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_Lamp_Sync(const void *context, const char *cmd,
+                                     const char *args, int cmdFlags) {
+	lamp_light_on();
+	L.bright = L.temp = 0;
+	step_to(&L.bright, 1, LAMP_STEPS, C_BRIGHT_UP, C_BRIGHT_DOWN);
+	step_to(&L.temp, 1, LAMP_STEPS, C_COLD, C_WARM);
+	L.speed = 0;                        // the fan is synced when it is next switched on
+	if (L.fan)
+		step_to(&L.speed, 1, LAMP_SPEEDS, C_FAN_UP, C_FAN_DOWN);
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_Lamp_Tune(const void *context, const char *cmd,
+                                     const char *args, int cmdFlags) {
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 1)
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	lir_gap = Tokenizer_GetArgInteger(0);
+	if (Tokenizer_GetArgsCount() > 1) {
+		lir_press_repeats = Tokenizer_GetArgInteger(1);
+		if (lir_press_repeats < 0)
+			lir_press_repeats = 0;
+		if (lir_press_repeats > LIR_MAX_REPEATS)
+			lir_press_repeats = LIR_MAX_REPEATS;
+	}
+	if (Tokenizer_GetArgsCount() > 2)
+		lir_boot = Tokenizer_GetArgInteger(2);
+	return CMD_RES_OK;
+}
+
+static commandResult_t CMD_Lamp_Status(const void *context, const char *cmd,
+                                       const char *args, int cmdFlags) {
+	addLogAdv(LOG_INFO, LOG_FEATURE_CMD,
+	          "Lamp: relay %i light %i fan %i bright %i temp %i speed %i, queue %i, gap %i repeats %i boot %i",
+	          relay(), L.light, L.fan, L.bright, L.temp, L.speed, lq.n,
+	          lir_gap, lir_press_repeats, lir_boot);
+	return CMD_RES_OK;
+}
+
+// ---------------------------------------------------------------------------
+//  Hardware commands
+// ---------------------------------------------------------------------------
 static commandResult_t CMD_LampIR_Setup(const void *context, const char *cmd,
                                         const char *args, int cmdFlags) {
 	Tokenizer_TokenizeString(args, 0);
@@ -200,45 +538,17 @@ static commandResult_t CMD_LampIR_Setup(const void *context, const char *cmd,
 	return CMD_RES_OK;
 }
 
-static commandResult_t CMD_LampIR_Send(const void *context, const char *cmd,
-                                       const char *args, int cmdFlags) {
-	int addr, code, repeats = 0;
-
-	Tokenizer_TokenizeString(args, 0);
-	if (Tokenizer_GetArgsCount() < 2)
-		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
-	if (lir_start() != CMD_RES_OK)
-		return CMD_RES_ERROR;
-
-	addr = strtol(Tokenizer_GetArg(0), 0, 16);
-	code = strtol(Tokenizer_GetArg(1), 0, 16);
-	if (Tokenizer_GetArgsCount() > 2)
-		repeats = Tokenizer_GetArgInteger(2);
-	if (repeats < 0)
-		repeats = 0;
-	if (repeats > LIR_MAX_REPEATS)
-		repeats = LIR_MAX_REPEATS;
-
-	lir_build(addr, code, repeats);
-	lir_go();
-
-	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: NEC addr 0x%X cmd 0x%X repeats %i",
-	          addr & 0xFF, code & 0xFF, repeats);
-	return CMD_RES_OK;
-}
-
 static commandResult_t CMD_LampIR_Code(const void *context, const char *cmd,
                                        const char *args, int cmdFlags) {
-	int i, k, repeats = 0;
-	uint32_t t = 0;
+	int i, repeats = 0;
 	const char *name;
 
 	Tokenizer_TokenizeString(args, 0);
 	name = Tokenizer_GetArgsCount() > 0 ? Tokenizer_GetArg(0) : "";
-	for (i = 0; i < (int)(sizeof(lir_codes) / sizeof(lir_codes[0])); i++)
+	for (i = 0; i < C_COUNT; i++)
 		if (!strcmp(name, lir_codes[i].name))
 			break;
-	if (i == (int)(sizeof(lir_codes) / sizeof(lir_codes[0]))) {
+	if (i == C_COUNT) {
 		addLogAdv(LOG_ERROR, LOG_FEATURE_CMD,
 		          "LampIR_Code <on|off|bright_up|bright_down|warm|cold|fan|fan_up|fan_down> [repeats]");
 		return CMD_RES_BAD_ARGUMENT;
@@ -253,41 +563,8 @@ static commandResult_t CMD_LampIR_Code(const void *context, const char *cmd,
 	if (repeats > LIR_MAX_REPEATS)
 		repeats = LIR_MAX_REPEATS;
 
-	lir_count = 0;
-	for (k = 0; k < 67; k++) {
-		lir_add(lir_codes[i].d[k]);
-		t += lir_codes[i].d[k];
-	}
-	lir_repeats(t, repeats);
-	lir_go();
-
+	lir_send(i, repeats);
 	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: code '%s' repeats %i", name, repeats);
-	return CMD_RES_OK;
-}
-
-static commandResult_t CMD_LampIR_Raw(const void *context, const char *cmd,
-                                      const char *args, int cmdFlags) {
-	const char *p = args;
-	char *e;
-
-	if (lir_start() != CMD_RES_OK)
-		return CMD_RES_ERROR;
-
-	lir_count = 0;
-	while (*p) {
-		long v = strtol(p, &e, 10);
-		if (e == p) {
-			p++;
-			continue;
-		}
-		lir_add((uint32_t)(v < 0 ? -v : v));
-		p = e;
-	}
-	if (lir_count < 2)
-		return CMD_RES_BAD_ARGUMENT;
-	lir_go();
-
-	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: raw frame, %i entries", lir_count);
 	return CMD_RES_OK;
 }
 
@@ -311,8 +588,7 @@ static commandResult_t CMD_LampIR_Carrier(const void *context, const char *cmd,
 	lir_add((uint32_t)ms * 1000);
 	lir_go();
 
-	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: %s for %i ms (a 38 kHz carrier = %i ISR/s)",
-	          lir_dc ? "pin HIGH" : "carrier", ms, 1000000 / LIR_TICK_US);
+	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: %s for %i ms", lir_dc ? "pin HIGH" : "carrier", ms);
 	return CMD_RES_OK;
 }
 
@@ -324,6 +600,12 @@ static commandResult_t CMD_LampIR_Status(const void *context, const char *cmd,
 	return CMD_RES_OK;
 }
 
+static int fv_get(int slot, int max) {
+	int v = HAL_FlashVars_GetChannelValue(slot);
+
+	return (v >= 1 && v <= max) ? v : 0;
+}
+
 void LampIR_Init(void) {
 	float real = 0;
 
@@ -332,26 +614,33 @@ void LampIR_Init(void) {
 	if (lir_timer < 0)
 		lir_timer = HAL_RequestHWTimer(LIR_TICK_US, &real, lir_tick, NULL);
 
+	memset(&L, 0, sizeof(L));
+	memset(&lq, 0, sizeof(lq));
+	lir_wait = 0;
+	L.bright = lamp_saved[0] = fv_get(LAMP_FV_BRIGHT, LAMP_STEPS);
+	L.temp = lamp_saved[1] = fv_get(LAMP_FV_TEMP, LAMP_STEPS);
+	L.speed = lamp_saved[2] = fv_get(LAMP_FV_SPEED, LAMP_SPEEDS);
+	L.light = relay();                  // a powered lamp is assumed lit, fan off
+	L.dirty = 1;
+
 	CMD_RegisterCommand("LampIR_Setup", CMD_LampIR_Setup, NULL);
-	CMD_RegisterCommand("LampIR_Send",  CMD_LampIR_Send,  NULL);
 	CMD_RegisterCommand("LampIR_Code",  CMD_LampIR_Code,  NULL);
-	CMD_RegisterCommand("LampIR_Raw",   CMD_LampIR_Raw,   NULL);
 	CMD_RegisterCommand("LampIR_Carrier", CMD_LampIR_Carrier, NULL);
 	CMD_RegisterCommand("LampIR_Status", CMD_LampIR_Status, NULL);
+	CMD_RegisterCommand("Lamp_Light",      CMD_Lamp_Light,      NULL);
+	CMD_RegisterCommand("Lamp_Brightness", CMD_Lamp_Brightness, NULL);
+	CMD_RegisterCommand("Lamp_Temp",       CMD_Lamp_Temp,       NULL);
+	CMD_RegisterCommand("Lamp_Fan",        CMD_Lamp_Fan,        NULL);
+	CMD_RegisterCommand("Lamp_Speed",      CMD_Lamp_Speed,      NULL);
+	CMD_RegisterCommand("Lamp_Click",      CMD_Lamp_Click,      NULL);
+	CMD_RegisterCommand("Lamp_Hold",       CMD_Lamp_Hold,       NULL);
+	CMD_RegisterCommand("Lamp_Set",        CMD_Lamp_Set,        NULL);
+	CMD_RegisterCommand("Lamp_Sync",       CMD_Lamp_Sync,       NULL);
+	CMD_RegisterCommand("Lamp_Tune",       CMD_Lamp_Tune,       NULL);
+	CMD_RegisterCommand("Lamp_Status",     CMD_Lamp_Status,     NULL);
 
 	addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR driver started, HW timer %i, tick %.1f us",
 	          (int)lir_timer, real);
-}
-
-// Real timer rate: a full second of carrier must log ~76923 ISR/s, otherwise the
-// carrier is not 38 kHz whatever the pin average says.
-void LampIR_OnEverySecond(void) {
-	static uint32_t prev;
-	uint32_t n = lir_isr;
-
-	if (n != prev)
-		addLogAdv(LOG_INFO, LOG_FEATURE_CMD, "LampIR: %u ISR in the last second", (unsigned)(n - prev));
-	prev = n;
 }
 
 void LampIR_StopDriver(void) {
@@ -364,4 +653,5 @@ void LampIR_StopDriver(void) {
 		HAL_PIN_SetOutputValue(lir_pin, 0);
 	lir_pin = -1;
 	lir_busy = 0;
+	lq.n = 0;
 }

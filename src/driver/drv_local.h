@@ -350,4 +350,5 @@ void MultiButton_RunQuickTick(void);
 void MultiButton_StopDriver(void);
 void LampIR_Init(void);
 void LampIR_StopDriver(void);
-void LampIR_OnEverySecond(void);
+void LampIR_RunQuickTick(void);
+void LampIR_OnChannelChanged(int ch, int val);
