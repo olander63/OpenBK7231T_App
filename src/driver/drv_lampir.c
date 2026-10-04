@@ -40,7 +40,7 @@
 //  Home Assistant: the driver publishes its own MQTT discovery (retained) after every
 //  MQTT connect: a "Світильник" device (JSON light: on/off, brightness, colour
 //  temperature, calibration button) and a "Вентилятор" device (fan: on/off, 6 speeds),
-//  both linked to the wall switch via via_device. State goes retained to
+//  both linked to the wall switch via via_device, plus the switch's click event. State goes retained to
 //  <clientId>/lamp_light|lamp_fan|lamp_speed/get; HA commands arrive on
 //  cmnd/<clientId>/Lamp_Light (JSON), Lamp_Fan, Lamp_Speed, Lamp_Sync.
 //
@@ -227,11 +227,12 @@ static struct {
 #define PUB_DISC_LIGHT   1
 #define PUB_DISC_FAN     2
 #define PUB_DISC_SYNC    4
-#define PUB_LIGHT        8
-#define PUB_FAN          16
-#define PUB_SPEED        32
+#define PUB_DISC_BUTTON  8
+#define PUB_LIGHT        16
+#define PUB_FAN          32
+#define PUB_SPEED        64
 #define PUB_STATE        (PUB_LIGHT | PUB_FAN | PUB_SPEED)
-#define PUB_ALL          63
+#define PUB_ALL          127
 #define LAMP_PUB_GAP_MS  100
 #define LAMP_KELVIN_MIN  2700
 #define LAMP_KELVIN_STEP 422        // 10 colour steps: 2700 K .. 6500 K
@@ -384,6 +385,15 @@ static OBK_Publish_Result lamp_publish_one(int bit) {
 		         "\"cmd_t\":\"cmnd/%s/Lamp_Sync\",\"payload_press\":\"1\",\"entity_category\":\"config\","
 		         "\"avty_t\":\"%s/connected\",\"dev\":%s}",
 		         dn, id, id, dev);
+		break;
+	case PUB_DISC_BUTTON:               // wall switch clicks, published by MultiButton to <id>/button/get
+		snprintf(topic, sizeof(topic), "homeassistant/event/%s_ir_button/config", dn);
+		snprintf(pub_buf, sizeof(pub_buf),
+		         "{\"name\":\"Вимикач — кнопка\",\"uniq_id\":\"obk_switch_button\","
+		         "\"state_topic\":\"%s/button/get\",\"avty_t\":\"%s/connected\","
+		         "\"value_template\":\"{\\\"event_type\\\": \\\"{{ value }}\\\"}\","
+		         "\"event_types\":[\"single\",\"double\",\"triple\",\"hold\"],\"dev\":{\"ids\":[\"%s\"]}}",
+		         id, id, dn);
 		break;
 	case PUB_LIGHT:
 		k = LAMP_KELVIN_MIN + ((L.temp > 0 ? L.temp : 1) - 1) * LAMP_KELVIN_STEP;
