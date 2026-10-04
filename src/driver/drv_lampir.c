@@ -360,7 +360,7 @@ static OBK_Publish_Result lamp_publish_one(int bit) {
 		lamp_device(dev, sizeof(dev), "light", "Світильник");
 		snprintf(topic, sizeof(topic), "homeassistant/light/%s_ir_light/config", dn);
 		snprintf(pub_buf, sizeof(pub_buf),
-		         "{\"name\":null,\"uniq_id\":\"%s_ir_light\",\"~\":\"%s\",\"schema\":\"json\","
+		         "{\"name\":null,\"uniq_id\":\"%s_ir_light\",\"~\":\"%s\",\"schema\":\"json\",\"icon\":\"mdi:ceiling-fan-light\","
 		         "\"cmd_t\":\"cmnd/%s/Lamp_Light\",\"stat_t\":\"~/lamp_light/get\",\"avty_t\":\"~/connected\","
 		         "\"brightness\":true,\"brightness_scale\":%i,\"supported_color_modes\":[\"color_temp\"],"
 		         "\"color_temp_kelvin\":true,\"min_kelvin\":%i,\"max_kelvin\":%i,\"dev\":%s}",
@@ -371,7 +371,7 @@ static OBK_Publish_Result lamp_publish_one(int bit) {
 		lamp_device(dev, sizeof(dev), "fan", "Вентилятор");
 		snprintf(topic, sizeof(topic), "homeassistant/fan/%s_ir_fan/config", dn);
 		snprintf(pub_buf, sizeof(pub_buf),
-		         "{\"name\":null,\"uniq_id\":\"%s_ir_fan\",\"~\":\"%s\","
+		         "{\"name\":null,\"uniq_id\":\"%s_ir_fan\",\"~\":\"%s\",\"icon\":\"mdi:ceiling-fan\","
 		         "\"cmd_t\":\"cmnd/%s/Lamp_Fan\",\"stat_t\":\"~/lamp_fan/get\",\"avty_t\":\"~/connected\","
 		         "\"percentage_command_topic\":\"cmnd/%s/Lamp_Speed\",\"percentage_state_topic\":\"~/lamp_speed/get\","
 		         "\"speed_range_min\":1,\"speed_range_max\":%i,\"dev\":%s}",
