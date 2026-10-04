@@ -37,8 +37,12 @@
 //      LampIR_Carrier <ms> [dc]       38 kHz burst / pin held HIGH, for checking the LED
 //      LampIR_Status
 //
-//  State is published retained to <clientId>/lamp/get as JSON
-//  {"light":1,"bright":5,"temp":3,"fan":0,"speed":2} (0 = unknown).
+//  Home Assistant: the driver publishes its own MQTT discovery (retained) after every
+//  MQTT connect: a "Світильник" device (JSON light: on/off, brightness, colour
+//  temperature, calibration button) and a "Вентилятор" device (fan: on/off, 6 speeds),
+//  both linked to the wall switch via via_device. State goes retained to
+//  <clientId>/lamp_light|lamp_fan|lamp_speed/get; HA commands arrive on
+//  cmnd/<clientId>/Lamp_Light (JSON), Lamp_Fan, Lamp_Speed, Lamp_Sync.
 //
 //  ponytail: no IR receiver, so a press on the real remote is invisible; tell the
 //            model with Lamp_Set or Lamp_Sync. Add a receiver pin to track it.
@@ -47,7 +51,9 @@
 // ============================================================================
 
 #include "../new_common.h"
+#include <ctype.h>
 #include "../new_pins.h"
+#include "../new_cfg.h"
 #include "../logging/logging.h"
 #include "../cmnds/cmd_public.h"
 #include "../hal/hal_pins.h"
@@ -215,8 +221,23 @@ static void lir_send(int code, int repeats) {
 static struct {
 	int light, fan;                     // assumed on / off
 	int bright, temp, speed;            // 1..max, 0 = unknown
-	int dirty;                          // needs publishing
 } L;
+
+// MQTT items still to publish (bit mask), one every LAMP_PUB_GAP_MS
+#define PUB_DISC_LIGHT   1
+#define PUB_DISC_FAN     2
+#define PUB_DISC_SYNC    4
+#define PUB_LIGHT        8
+#define PUB_FAN          16
+#define PUB_SPEED        32
+#define PUB_STATE        (PUB_LIGHT | PUB_FAN | PUB_SPEED)
+#define PUB_ALL          63
+#define LAMP_PUB_GAP_MS  100
+#define LAMP_KELVIN_MIN  2700
+#define LAMP_KELVIN_STEP 422        // 10 colour steps: 2700 K .. 6500 K
+static int pub_todo = PUB_ALL;
+static int pub_wait;
+static char pub_buf[640];
 
 static struct { uint8_t c[LAMP_QUEUE]; int h, n; } lq;      // remote presses to send
 static int lir_wait;                    // ms until the next press may start
@@ -242,7 +263,7 @@ static void q_add(int code) {
 static void light_set(int on) {
 	q_add(on ? C_ON : C_OFF);
 	L.light = on;
-	L.dirty = 1;
+	pub_todo |= PUB_STATE;
 }
 
 // Relay on powers the lamp: it lights up by itself, the fan stays off.
@@ -259,7 +280,7 @@ void LampIR_OnChannelChanged(int ch, int val) {
 		L.light = L.fan = 0;
 		lq.n = 0;                       // the lamp has no power, drop pending presses
 	}
-	L.dirty = 1;
+	pub_todo |= PUB_STATE;
 }
 
 // true if the lamp had no power (it then lights up by itself)
@@ -293,7 +314,7 @@ static void step_to(int *cur, int target, int max, int up, int down) {
 		for (n = 0; n < LAMP_OVERSHOOT; n++)
 			q_add(target == max ? up : down);
 	*cur = target;
-	L.dirty = 1;
+	pub_todo |= PUB_STATE;
 }
 
 static void lamp_fan(int on) {
@@ -305,7 +326,7 @@ static void lamp_fan(int on) {
 	L.fan = on;
 	if (on && !L.speed)
 		step_to(&L.speed, 1, LAMP_SPEEDS, C_FAN_UP, C_FAN_DOWN);
-	L.dirty = 1;
+	pub_todo |= PUB_STATE;
 }
 
 static void lamp_save(void) {
@@ -320,19 +341,70 @@ static void lamp_save(void) {
 		}
 }
 
-static void lamp_publish(void) {
-	char s[80];
-
-	snprintf(s, sizeof(s), "{\"light\":%i,\"bright\":%i,\"temp\":%i,\"fan\":%i,\"speed\":%i}",
-	         L.light, L.bright, L.temp, L.fan, L.speed);
-	if (MQTT_PublishMain_StringString("lamp", s, OBK_PUBLISH_FLAG_RETAIN) == OBK_PUBLISH_OK)
-		L.dirty = 0;
+static void lamp_device(char *o, int n, const char *suffix, const char *name) {
+	snprintf(o, n, "{\"ids\":[\"%s_%s\"],\"name\":\"%s\",\"mf\":\"Inspire\","
+	         "\"mdl\":\"Ceiling light + fan (IR)\",\"via_device\":\"%s\"}",
+	         CFG_GetDeviceName(), suffix, name, CFG_GetDeviceName());
 }
 
-// Called from the OBK main loop: paces the remote presses and publishes the state.
+// Publish one item of pub_todo. Discovery topics use the device name (like OBK's own
+// discovery), state / command topics use the MQTT client id.
+static OBK_Publish_Result lamp_publish_one(int bit) {
+	const char *id = CFG_GetMQTTClientId(), *dn = CFG_GetDeviceName();
+	char dev[200], topic[96];
+	int k;
+
+	switch (bit) {
+	case PUB_DISC_LIGHT:
+		lamp_device(dev, sizeof(dev), "light", "Світильник");
+		snprintf(topic, sizeof(topic), "homeassistant/light/%s_ir_light/config", dn);
+		snprintf(pub_buf, sizeof(pub_buf),
+		         "{\"name\":null,\"uniq_id\":\"%s_ir_light\",\"~\":\"%s\",\"schema\":\"json\","
+		         "\"cmd_t\":\"cmnd/%s/Lamp_Light\",\"stat_t\":\"~/lamp_light/get\",\"avty_t\":\"~/connected\","
+		         "\"brightness\":true,\"brightness_scale\":%i,\"supported_color_modes\":[\"color_temp\"],"
+		         "\"color_temp_kelvin\":true,\"min_kelvin\":%i,\"max_kelvin\":%i,\"dev\":%s}",
+		         dn, id, id, LAMP_STEPS, LAMP_KELVIN_MIN,
+		         LAMP_KELVIN_MIN + (LAMP_STEPS - 1) * LAMP_KELVIN_STEP, dev);
+		break;
+	case PUB_DISC_FAN:
+		lamp_device(dev, sizeof(dev), "fan", "Вентилятор");
+		snprintf(topic, sizeof(topic), "homeassistant/fan/%s_ir_fan/config", dn);
+		snprintf(pub_buf, sizeof(pub_buf),
+		         "{\"name\":null,\"uniq_id\":\"%s_ir_fan\",\"~\":\"%s\","
+		         "\"cmd_t\":\"cmnd/%s/Lamp_Fan\",\"stat_t\":\"~/lamp_fan/get\",\"avty_t\":\"~/connected\","
+		         "\"percentage_command_topic\":\"cmnd/%s/Lamp_Speed\",\"percentage_state_topic\":\"~/lamp_speed/get\","
+		         "\"speed_range_min\":1,\"speed_range_max\":%i,\"dev\":%s}",
+		         dn, id, id, id, LAMP_SPEEDS, dev);
+		break;
+	case PUB_DISC_SYNC:
+		lamp_device(dev, sizeof(dev), "light", "Світильник");
+		snprintf(topic, sizeof(topic), "homeassistant/button/%s_ir_sync/config", dn);
+		snprintf(pub_buf, sizeof(pub_buf),
+		         "{\"name\":\"Калібрування\",\"uniq_id\":\"%s_ir_sync\","
+		         "\"cmd_t\":\"cmnd/%s/Lamp_Sync\",\"payload_press\":\"1\",\"entity_category\":\"config\","
+		         "\"avty_t\":\"%s/connected\",\"dev\":%s}",
+		         dn, id, id, dev);
+		break;
+	case PUB_LIGHT:
+		k = LAMP_KELVIN_MIN + ((L.temp > 0 ? L.temp : 1) - 1) * LAMP_KELVIN_STEP;
+		snprintf(pub_buf, sizeof(pub_buf),
+		         "{\"state\":\"%s\",\"brightness\":%i,\"color_mode\":\"color_temp\",\"color_temp\":%i}",
+		         L.light ? "ON" : "OFF", L.bright > 0 ? L.bright : 1, k);
+		return MQTT_PublishMain_StringString("lamp_light", pub_buf, OBK_PUBLISH_FLAG_RETAIN);
+	case PUB_FAN:
+		return MQTT_PublishMain_StringString("lamp_fan", L.fan ? "ON" : "OFF", OBK_PUBLISH_FLAG_RETAIN);
+	default:
+		return MQTT_PublishMain_StringInt("lamp_speed", L.speed, OBK_PUBLISH_FLAG_RETAIN);
+	}
+	if (strlen(pub_buf) >= sizeof(pub_buf) - 1)
+		return OBK_PUBLISH_OK;          // would be cut off, skip rather than send broken JSON
+	return MQTT_Publish(topic, topic, pub_buf, OBK_PUBLISH_FLAG_RETAIN | OBK_PUBLISH_FLAG_RAW_TOPIC_NAME);
+}
+
+// Called from the OBK main loop: paces the remote presses and publishes to MQTT.
 void LampIR_RunQuickTick(void) {
 	static int wasReady;
-	int dt = g_deltaTimeMS, ready;
+	int dt = g_deltaTimeMS, ready, bit;
 
 	if (dt <= 0)
 		dt = 1;
@@ -340,6 +412,8 @@ void LampIR_RunQuickTick(void) {
 		dt = 200;                       // ignore huge stalls (OTA, scan, ...)
 	if (lir_wait > 0)
 		lir_wait -= dt;
+	if (pub_wait > 0)
+		pub_wait -= dt;
 
 	if (lq.n && lir_wait <= 0 && !lir_busy && lir_pin >= 0 && lir_timer >= 0) {
 		lir_send(lq.c[lq.h], lir_press_repeats);
@@ -352,20 +426,30 @@ void LampIR_RunQuickTick(void) {
 
 	ready = MQTT_IsReady();
 	if (ready && !wasReady)
-		L.dirty = 1;
+		pub_todo = PUB_ALL;             // retained data may be gone, send everything again
 	wasReady = ready;
-	if (L.dirty && ready)
-		lamp_publish();
+	if (ready && pub_todo && pub_wait <= 0) {
+		for (bit = 1; !(pub_todo & bit); bit <<= 1)
+			;
+		if (lamp_publish_one(bit) == OBK_PUBLISH_OK)
+			pub_todo &= ~bit;
+		pub_wait = LAMP_PUB_GAP_MS;
+	}
 }
 
-// on / off / toggle -> 1 / 0, anything else -> -1
+// on / off / toggle (any case) -> 1 / 0, anything else -> -1
 static int onoff_arg(const char *args, int cur) {
-	const char *a;
+	char a[8];
+	const char *s;
+	int i;
 
 	Tokenizer_TokenizeString(args, 0);
 	if (Tokenizer_GetArgsCount() < 1)
 		return -1;
-	a = Tokenizer_GetArg(0);
+	s = Tokenizer_GetArg(0);
+	for (i = 0; i < (int)sizeof(a) - 1 && s[i]; i++)
+		a[i] = (char)tolower((unsigned char)s[i]);
+	a[i] = 0;
 	if (!strcmp(a, "toggle"))
 		return !cur;
 	if (!strcmp(a, "on") || !strcmp(a, "1"))
@@ -375,10 +459,70 @@ static int onoff_arg(const char *args, int cur) {
 	return -1;
 }
 
+// integer value of "key": in a flat JSON text
+static int json_int(const char *s, const char *key, int *out) {
+	char k[24];
+	const char *p;
+
+	snprintf(k, sizeof(k), "\"%s\"", key);
+	p = strstr(s, k);
+	if (p)
+		p = strchr(p + strlen(k), ':');
+	if (!p)
+		return 0;
+	*out = atoi(p + 1);
+	return 1;
+}
+
+// set a stepped value, clamped, and make sure the right device is on
+static void lamp_value(int v, int *cur, int max, int up, int down, int fan) {
+	if (v < 1)
+		v = 1;
+	if (v > max)
+		v = max;
+	if (fan)
+		lamp_fan(1);
+	else
+		lamp_light_on();
+	step_to(cur, v, max, up, down);
+}
+
+static commandResult_t lamp_value_cmd(const char *args, int *cur, int max, int up, int down, int fan) {
+	int v;
+
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 1)
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	v = Tokenizer_GetArgInteger(0);
+	if (v < 1 || v > max)
+		return CMD_RES_BAD_ARGUMENT;
+	lamp_value(v, cur, max, up, down, fan);
+	return CMD_RES_OK;
+}
+
+// Plain "on|off|toggle", or the JSON Home Assistant sends for a json-schema light:
+// {"state":"ON","brightness":7,"color_temp":4000}
 static commandResult_t CMD_Lamp_Light(const void *context, const char *cmd,
                                       const char *args, int cmdFlags) {
-	int on = onoff_arg(args, L.light);
+	int on, v;
 
+	if (args && args[0] == '{') {
+		if (strstr(args, "\"OFF\"")) {
+			if (relay())
+				light_set(0);
+			return CMD_RES_OK;
+		}
+		if (strstr(args, "\"ON\""))
+			lamp_light_on();
+		if (json_int(args, "brightness", &v))
+			lamp_value(v, &L.bright, LAMP_STEPS, C_BRIGHT_UP, C_BRIGHT_DOWN, 0);
+		if (json_int(args, "color_temp", &v)) {
+			v = (v - LAMP_KELVIN_MIN + LAMP_KELVIN_STEP / 2) / LAMP_KELVIN_STEP + 1;
+			lamp_value(v, &L.temp, LAMP_STEPS, C_COLD, C_WARM, 0);
+		}
+		return CMD_RES_OK;
+	}
+	on = onoff_arg(args, L.light);
 	if (on < 0)
 		return CMD_RES_BAD_ARGUMENT;
 	if (on)
@@ -398,37 +542,19 @@ static commandResult_t CMD_Lamp_Fan(const void *context, const char *cmd,
 	return CMD_RES_OK;
 }
 
-// shared by Lamp_Brightness / Lamp_Temp / Lamp_Speed
-static commandResult_t lamp_value(const char *args, int *cur, int max, int up, int down, int fan) {
-	int v;
-
-	Tokenizer_TokenizeString(args, 0);
-	if (Tokenizer_GetArgsCount() < 1)
-		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
-	v = Tokenizer_GetArgInteger(0);
-	if (v < 1 || v > max)
-		return CMD_RES_BAD_ARGUMENT;
-	if (fan)
-		lamp_fan(1);
-	else
-		lamp_light_on();
-	step_to(cur, v, max, up, down);
-	return CMD_RES_OK;
-}
-
 static commandResult_t CMD_Lamp_Brightness(const void *context, const char *cmd,
                                            const char *args, int cmdFlags) {
-	return lamp_value(args, &L.bright, LAMP_STEPS, C_BRIGHT_UP, C_BRIGHT_DOWN, 0);
+	return lamp_value_cmd(args, &L.bright, LAMP_STEPS, C_BRIGHT_UP, C_BRIGHT_DOWN, 0);
 }
 
 static commandResult_t CMD_Lamp_Temp(const void *context, const char *cmd,
                                      const char *args, int cmdFlags) {
-	return lamp_value(args, &L.temp, LAMP_STEPS, C_COLD, C_WARM, 0);
+	return lamp_value_cmd(args, &L.temp, LAMP_STEPS, C_COLD, C_WARM, 0);
 }
 
 static commandResult_t CMD_Lamp_Speed(const void *context, const char *cmd,
                                       const char *args, int cmdFlags) {
-	return lamp_value(args, &L.speed, LAMP_SPEEDS, C_FAN_UP, C_FAN_DOWN, 1);
+	return lamp_value_cmd(args, &L.speed, LAMP_SPEEDS, C_FAN_UP, C_FAN_DOWN, 1);
 }
 
 // Wall switch: 1 click = relay on / light toggle, 2 clicks = relay on (light stays off) / fan toggle.
@@ -478,7 +604,7 @@ static commandResult_t CMD_Lamp_Set(const void *context, const char *cmd,
 		L.speed = v;
 	else
 		return CMD_RES_BAD_ARGUMENT;
-	L.dirty = 1;
+	pub_todo |= PUB_STATE;
 	return CMD_RES_OK;
 }
 
@@ -621,7 +747,7 @@ void LampIR_Init(void) {
 	L.temp = lamp_saved[1] = fv_get(LAMP_FV_TEMP, LAMP_STEPS);
 	L.speed = lamp_saved[2] = fv_get(LAMP_FV_SPEED, LAMP_SPEEDS);
 	L.light = relay();                  // a powered lamp is assumed lit, fan off
-	L.dirty = 1;
+	pub_todo = PUB_ALL;
 
 	CMD_RegisterCommand("LampIR_Setup", CMD_LampIR_Setup, NULL);
 	CMD_RegisterCommand("LampIR_Code",  CMD_LampIR_Code,  NULL);
