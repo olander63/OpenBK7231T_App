@@ -8,7 +8,7 @@
 //                                                      leave its OBK pin role as None
 //
 //  Behaviour:
-//      hold  (>= 500 ms)    -> 'Lamp_Hold' (relay off) + MQTT 'hold'
+//      hold  (>= 500 ms)    -> 'Lamp_Hold' (relay toggle) + MQTT 'hold'
 //      hold  (>= 10 s)      -> forces config/AP mode (built-in 'OpenAP')
 //      1 / 2 / 3 clicks     -> 'Lamp_Click <n>' + MQTT 'single' / 'double' / 'triple'
 //      The Lamp_* commands come from the LampIR driver (drv_lampir.c); without it

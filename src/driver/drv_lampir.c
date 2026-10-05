@@ -27,7 +27,7 @@
 //      Lamp_Fan <on|off|toggle>
 //      Lamp_Speed <1..6>              turns the fan on if needed
 //      Lamp_Click <1|2|3>             what a wall-switch click does (MultiButton calls it)
-//      Lamp_Hold                      relay off, light + fan off
+//      Lamp_Hold                      relay toggle (off: light + fan off)
 //      Lamp_Set <light|fan|bright|temp|speed> <value>   fix the model, sends nothing
 //      Lamp_Sync                      drive brightness, colour, speed to their lowest stop
 //      Lamp_Tune <gapMs> [repeats] [bootMs]   time between remote presses, NEC repeat
@@ -585,10 +585,10 @@ static commandResult_t CMD_Lamp_Click(const void *context, const char *cmd,
 	return CMD_RES_OK;
 }
 
+// Hold toggles the relay: off drops light + fan, on powers the lamp (it lights up by itself).
 static commandResult_t CMD_Lamp_Hold(const void *context, const char *cmd,
                                      const char *args, int cmdFlags) {
-	if (relay())
-		CHANNEL_Set(LAMP_RELAY_CH, 0, 0);
+	CHANNEL_Set(LAMP_RELAY_CH, !relay(), 0);
 	return CMD_RES_OK;
 }
 
