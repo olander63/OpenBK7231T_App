@@ -26,6 +26,7 @@
 //      Lamp_Temp <1..10>              1 = 2700K warm ... 10 = 6500K cold
 //      Lamp_Fan <on|off|toggle>
 //      Lamp_Speed <1..6>              turns the fan on if needed
+//      Lamp_FanLight {"state":..,"brightness":1..6}   the fan as a json light (HA slider card)
 //      Lamp_Click <1|2|3>             what a wall-switch click does (MultiButton calls it)
 //      Lamp_Hold                      relay toggle (off: light + fan off)
 //      Lamp_Set <light|fan|bright|temp|speed> <value>   fix the model, sends nothing
@@ -228,11 +229,13 @@ static struct {
 #define PUB_DISC_FAN     2
 #define PUB_DISC_SYNC    4
 #define PUB_DISC_BUTTON  8
-#define PUB_LIGHT        16
-#define PUB_FAN          32
-#define PUB_SPEED        64
-#define PUB_STATE        (PUB_LIGHT | PUB_FAN | PUB_SPEED)
-#define PUB_ALL          127
+#define PUB_DISC_FANLIGHT 16
+#define PUB_LIGHT        32
+#define PUB_FAN          64
+#define PUB_SPEED        128
+#define PUB_FANLIGHT     256
+#define PUB_STATE        (PUB_LIGHT | PUB_FAN | PUB_SPEED | PUB_FANLIGHT)
+#define PUB_ALL          511
 #define LAMP_PUB_GAP_MS  100
 #define LAMP_KELVIN_MIN  2700
 #define LAMP_KELVIN_STEP 422        // 10 colour steps: 2700 K .. 6500 K
@@ -395,12 +398,26 @@ static OBK_Publish_Result lamp_publish_one(int bit) {
 		         "\"event_types\":[\"single\",\"double\",\"triple\",\"hold\"],\"dev\":{\"ids\":[\"%s\"]}}",
 		         id, id, dn);
 		break;
+	case PUB_DISC_FANLIGHT:             // the fan speed as a json light: the big slider card only takes lights
+		lamp_device(dev, sizeof(dev), "fan", "Вентилятор");
+		snprintf(topic, sizeof(topic), "homeassistant/light/%s_ir_fanlight/config", dn);
+		snprintf(pub_buf, sizeof(pub_buf),
+		         "{\"name\":\"Швидкість\",\"uniq_id\":\"%s_ir_fanlight\",\"~\":\"%s\",\"schema\":\"json\","
+		         "\"icon\":\"mdi:ceiling-fan\",\"cmd_t\":\"cmnd/%s/Lamp_FanLight\","
+		         "\"stat_t\":\"~/lamp_fanlight/get\",\"avty_t\":\"~/connected\","
+		         "\"brightness\":true,\"brightness_scale\":%i,\"supported_color_modes\":[\"brightness\"],\"dev\":%s}",
+		         dn, id, id, LAMP_SPEEDS, dev);
+		break;
 	case PUB_LIGHT:
 		k = LAMP_KELVIN_MIN + ((L.temp > 0 ? L.temp : 1) - 1) * LAMP_KELVIN_STEP;
 		snprintf(pub_buf, sizeof(pub_buf),
 		         "{\"state\":\"%s\",\"brightness\":%i,\"color_mode\":\"color_temp\",\"color_temp\":%i}",
 		         L.light ? "ON" : "OFF", L.bright > 0 ? L.bright : 1, k);
 		return MQTT_PublishMain_StringString("lamp_light", pub_buf, OBK_PUBLISH_FLAG_RETAIN);
+	case PUB_FANLIGHT:
+		snprintf(pub_buf, sizeof(pub_buf), "{\"state\":\"%s\",\"brightness\":%i,\"color_mode\":\"brightness\"}",
+		         L.fan ? "ON" : "OFF", L.speed > 0 ? L.speed : 1);
+		return MQTT_PublishMain_StringString("lamp_fanlight", pub_buf, OBK_PUBLISH_FLAG_RETAIN);
 	case PUB_FAN:
 		return MQTT_PublishMain_StringString("lamp_fan", L.fan ? "ON" : "OFF", OBK_PUBLISH_FLAG_RETAIN);
 	default:
@@ -549,6 +566,23 @@ static commandResult_t CMD_Lamp_Fan(const void *context, const char *cmd,
 	if (on < 0)
 		return CMD_RES_BAD_ARGUMENT;
 	lamp_fan(on);
+	return CMD_RES_OK;
+}
+
+// The fan speed as a json light, same payloads as Lamp_Light: {"state":"ON","brightness":4}
+static commandResult_t CMD_Lamp_FanLight(const void *context, const char *cmd,
+                                         const char *args, int cmdFlags) {
+	int v;
+
+	if (!args || args[0] != '{')
+		return CMD_RES_BAD_ARGUMENT;
+	if (strstr(args, "\"OFF\"")) {
+		lamp_fan(0);
+		return CMD_RES_OK;
+	}
+	lamp_fan(1);
+	if (json_int(args, "brightness", &v))
+		lamp_value(v, &L.speed, LAMP_SPEEDS, C_FAN_UP, C_FAN_DOWN, 1);
 	return CMD_RES_OK;
 }
 
@@ -767,6 +801,7 @@ void LampIR_Init(void) {
 	CMD_RegisterCommand("Lamp_Brightness", CMD_Lamp_Brightness, NULL);
 	CMD_RegisterCommand("Lamp_Temp",       CMD_Lamp_Temp,       NULL);
 	CMD_RegisterCommand("Lamp_Fan",        CMD_Lamp_Fan,        NULL);
+	CMD_RegisterCommand("Lamp_FanLight",   CMD_Lamp_FanLight,   NULL);
 	CMD_RegisterCommand("Lamp_Speed",      CMD_Lamp_Speed,      NULL);
 	CMD_RegisterCommand("Lamp_Click",      CMD_Lamp_Click,      NULL);
 	CMD_RegisterCommand("Lamp_Hold",       CMD_Lamp_Hold,       NULL);
